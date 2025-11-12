@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  mainpipe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mainpipe
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: mainpipe run -c config.yaml
+    networks:
+      - mainpipe-network
+
+networks:
+  mainpipe-network:
+    driver: bridge
