@@ -313,8 +313,8 @@ mypy src/
 
 ## License
 
-MIT License
+This work is licensed under a Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License.
 
 ## Author
 
-Aaron Kwong - Technical Assessment for Maincode
+Aaron Kwok
