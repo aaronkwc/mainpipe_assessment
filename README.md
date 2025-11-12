@@ -133,6 +133,10 @@ mainpipe inspect -i data/processed -o data/reports
 
 #### Docker Execution
 
+**Note:** Docker builds may encounter SSL certificate verification issues in some restricted environments. The pipeline is fully functional when installed locally using pip.
+
+If your environment has proper SSL configuration:
+
 ```bash
 # Run with Docker Compose
 docker-compose up

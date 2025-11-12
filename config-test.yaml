@@ -1,9 +1,8 @@
-# Pipeline Configuration
+# Pipeline Configuration - Simple Test
 
 # Data acquisition
 data_dir: data/raw
 data_urls: []
-  # - https://example.com/dataset.jsonl
 local_files:
   - data/raw/sample.jsonl
 
@@ -11,36 +10,30 @@ local_files:
 cleaning:
   min_length: 50
   max_length: 100000
-  remove_urls: false
-  remove_emails: false
 
 # Language filtering
 language: en
 allowed_languages:
   - en
-  - es
-  - fr
 lang_confidence: 0.7
 
 # Duplicate detection
 remove_duplicates: true
-dup_method: exact  # exact, fuzzy, hash
+dup_method: exact
 
-# PII detection
+# PII detection (using simple pattern matching)
 remove_pii: false
 pii_threshold: 0.5
 
 # Tokenization
-tokenizer_type: bpe  # bpe, wordpiece, pretrained
-vocab_size: 30000
+tokenizer_type: bpe
+vocab_size: 5000
 train_tokenizer: true
-# pretrained_tokenizer: bert-base-uncased
-# tokenizer_path: data/tokenizer.json
 
 # Export settings
 output_dir: data/processed
 reports_dir: data/reports
-shard_size: 10000
+shard_size: 50
 
 # Logging
 log_level: INFO
