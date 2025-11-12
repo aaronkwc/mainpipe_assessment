@@ -3,7 +3,7 @@
 # Data acquisition
 data_dir: data/raw
 data_urls: []
-  # - https://example.com/dataset.jsonl
+   - https://s3.us-east-1.amazonaws.com/mainpipe.maincode.com/mainpipe_data_v1.jsonl
 local_files: []
   # - data/raw/sample.jsonl
 
