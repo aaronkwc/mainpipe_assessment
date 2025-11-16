@@ -2,10 +2,10 @@
 
 # Data acquisition
 data_dir: data/raw
-data_urls: []
-   - https://s3.us-east-1.amazonaws.com/mainpipe.maincode.com/mainpipe_data_v1.jsonl
+data_urls:
+  - https://s3.us-east-1.amazonaws.com/mainpipe.maincode.com/mainpipe_data_v1.jsonl
 local_files: []
-  # - data/raw/sample.jsonl
+# - data/raw/sample.jsonl
 
 # Cleaning and normalization
 cleaning:
@@ -44,3 +44,12 @@ shard_size: 10000
 
 # Logging
 log_level: INFO
+
+# Development/test helpers
+# Limit the number of texts processed for quick local tests. Set to null to process all.
+sample_size: 200
+# Number of workers to use for processing. Set to 1 to run single-threaded.
+workers: 4
+# parallel_mode: 'process' will use multiprocessing (may duplicate models per process).
+# parallel_mode: 'thread' will use threads (shares model instances, safer when spaCy/presidio are used).
+parallel_mode: thread

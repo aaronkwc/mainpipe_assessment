@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 import json
 from tqdm import tqdm
+import os
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 
 from mainpipe.acquisition.downloader import DataAcquisition
 from mainpipe.cleaning.cleaner import DataCleaner
@@ -18,6 +22,92 @@ from mainpipe.utils.pii_detector import PIIDetector
 from mainpipe.utils.duplicate_detector import DuplicateDetector
 
 logger = logging.getLogger(__name__)
+
+
+# Globals used when using multiprocessing initializer
+_GLOBAL_CLEANER = None
+_GLOBAL_LANG = None
+_GLOBAL_PII = None
+_GLOBAL_DUP = None
+_GLOBAL_CONFIG = None
+
+
+def _worker_init(config: Dict):
+    """Initializer for worker processes: instantiate heavy objects once per process."""
+    global _GLOBAL_CLEANER, _GLOBAL_LANG, _GLOBAL_PII, _GLOBAL_DUP, _GLOBAL_CONFIG
+    from mainpipe.cleaning.cleaner import DataCleaner
+    from mainpipe.utils.language_detector import LanguageDetector
+    from mainpipe.utils.pii_detector import PIIDetector
+    from mainpipe.utils.duplicate_detector import DuplicateDetector
+
+    _GLOBAL_CONFIG = config
+    _GLOBAL_CLEANER = DataCleaner(config=config.get('cleaning', {}))
+    _GLOBAL_LANG = LanguageDetector(confidence_threshold=config.get('lang_confidence', 0.7))
+    _GLOBAL_PII = PIIDetector(
+        language=config.get('language', 'en'),
+        score_threshold=config.get('pii_threshold', 0.5),
+        spacy_model=config.get('spacy_model')
+    )
+    _GLOBAL_DUP = DuplicateDetector(method=config.get('dup_method', 'exact'))
+
+
+def _process_text_worker(text: str) -> Dict:
+    """Process a single text using global worker instances. Returns processed dict."""
+    global _GLOBAL_CLEANER, _GLOBAL_LANG, _GLOBAL_PII, _GLOBAL_DUP, _GLOBAL_CONFIG
+
+    # Fallback to raising if not initialized
+    if _GLOBAL_CLEANER is None:
+        raise RuntimeError("Worker not initialized: call _worker_init in process pool initializer")
+
+    cleaned_text, drop_reason = _GLOBAL_CLEANER.clean_text(text)
+
+    if cleaned_text is None:
+        return {'text': None, 'dropped': True, 'drop_reason': drop_reason}
+
+    lang, lang_score = _GLOBAL_LANG.detect_language(cleaned_text)
+
+    allowed_langs = _GLOBAL_CONFIG.get('allowed_languages', None)
+    if allowed_langs and lang not in allowed_langs:
+        return {
+            'text': None,
+            'dropped': True,
+            'drop_reason': f'language_filtered_{lang}',
+            'language': lang,
+            'language_score': lang_score
+        }
+
+    is_duplicate = _GLOBAL_DUP.is_duplicate(cleaned_text)
+    if is_duplicate and _GLOBAL_CONFIG.get('remove_duplicates', True):
+        return {
+            'text': None,
+            'dropped': True,
+            'drop_reason': 'duplicate',
+            'language': lang,
+            'language_score': lang_score
+        }
+
+    pii_entities = _GLOBAL_PII.detect_pii(cleaned_text)
+    has_pii = len(pii_entities) > 0
+    if has_pii and _GLOBAL_CONFIG.get('remove_pii', False):
+        return {
+            'text': None,
+            'dropped': True,
+            'drop_reason': 'pii_found',
+            'language': lang,
+            'language_score': lang_score,
+            'pii_count': len(pii_entities)
+        }
+
+    return {
+        'text': cleaned_text,
+        'dropped': False,
+        'language': lang,
+        'language_score': lang_score,
+        'is_duplicate': is_duplicate,
+        'has_pii': has_pii,
+        'pii_count': len(pii_entities),
+        'length': len(cleaned_text)
+    }
 
 
 class Pipeline:
@@ -58,9 +148,23 @@ class Pipeline:
             confidence_threshold=config.get('lang_confidence', 0.7)
         )
         
+        # Parallelization options
+        # workers: int (number of workers to use)
+        # parallel_mode: 'process' | 'thread'
+        # sample_size: optional int to limit number of texts for quick tests
+        self.workers = int(config.get('workers', max(1, (os.cpu_count() or 1) - 1)))
+        # If a spaCy model is configured (often used by Presidio), prefer threaded
+        # execution by default to avoid re-loading heavy models per process.
+        if config.get('parallel_mode') is not None:
+            self.parallel_mode = config.get('parallel_mode')
+        else:
+            self.parallel_mode = 'thread' if config.get('spacy_model') else 'process'
+        self.sample_size = config.get('sample_size', None)
+
         self.pii_detector = PIIDetector(
             language=config.get('language', 'en'),
-            score_threshold=config.get('pii_threshold', 0.5)
+            score_threshold=config.get('pii_threshold', 0.5),
+            spacy_model=config.get('spacy_model')
         )
         
         self.dup_detector = DuplicateDetector(
@@ -69,6 +173,7 @@ class Pipeline:
         
         self.processed_data = []
         self.pipeline_stats = {}
+        
     
     def acquire_data(self) -> List[Path]:
         """
@@ -147,6 +252,12 @@ class Pipeline:
                 logger.error(f"Error loading {filepath}: {e}")
         
         logger.info(f"Loaded {len(texts)} texts")
+        # If sample_size configured, trim for quick tests
+        if self.sample_size:
+            orig = len(texts)
+            texts = texts[: int(self.sample_size) ]
+            logger.info(f"Trimmed texts to sample_size={self.sample_size} (from {orig} to {len(texts)})")
+
         return texts
     
     def process_data(self, texts: List[str]) -> List[Dict]:
@@ -160,76 +271,137 @@ class Pipeline:
             List of processed data dictionaries
         """
         logger.info(f"Processing {len(texts)} texts...")
-        
-        processed = []
-        
-        for text in tqdm(texts, desc="Processing texts"):
-            # Clean text
-            cleaned_text, drop_reason = self.cleaner.clean_text(text)
-            
-            if cleaned_text is None:
+
+        # If only single worker requested, fall back to sequential processing
+        if not self.workers or int(self.workers) <= 1:
+            processed = []
+            for text in tqdm(texts, desc="Processing texts"):
+                cleaned_text, drop_reason = self.cleaner.clean_text(text)
+                if cleaned_text is None:
+                    processed.append({'text': None, 'dropped': True, 'drop_reason': drop_reason})
+                    continue
+
+                lang, lang_score = self.lang_detector.detect_language(cleaned_text)
+                allowed_langs = self.config.get('allowed_languages', None)
+                if allowed_langs and lang not in allowed_langs:
+                    processed.append({
+                        'text': None,
+                        'dropped': True,
+                        'drop_reason': f'language_filtered_{lang}',
+                        'language': lang,
+                        'language_score': lang_score
+                    })
+                    continue
+
+                is_duplicate = self.dup_detector.is_duplicate(cleaned_text)
+                if is_duplicate and self.config.get('remove_duplicates', True):
+                    processed.append({
+                        'text': None,
+                        'dropped': True,
+                        'drop_reason': 'duplicate',
+                        'language': lang,
+                        'language_score': lang_score
+                    })
+                    continue
+
+                pii_entities = self.pii_detector.detect_pii(cleaned_text)
+                has_pii = len(pii_entities) > 0
+                if has_pii and self.config.get('remove_pii', False):
+                    processed.append({
+                        'text': None,
+                        'dropped': True,
+                        'drop_reason': 'pii_found',
+                        'language': lang,
+                        'language_score': lang_score,
+                        'pii_count': len(pii_entities)
+                    })
+                    continue
+
                 processed.append({
-                    'text': None,
-                    'dropped': True,
-                    'drop_reason': drop_reason
-                })
-                continue
-            
-            # Language detection
-            lang, lang_score = self.lang_detector.detect_language(cleaned_text)
-            
-            # Check language filter
-            allowed_langs = self.config.get('allowed_languages', None)
-            if allowed_langs and lang not in allowed_langs:
-                processed.append({
-                    'text': None,
-                    'dropped': True,
-                    'drop_reason': f'language_filtered_{lang}',
-                    'language': lang,
-                    'language_score': lang_score
-                })
-                continue
-            
-            # Duplicate detection
-            is_duplicate = self.dup_detector.is_duplicate(cleaned_text)
-            
-            if is_duplicate and self.config.get('remove_duplicates', True):
-                processed.append({
-                    'text': None,
-                    'dropped': True,
-                    'drop_reason': 'duplicate',
-                    'language': lang,
-                    'language_score': lang_score
-                })
-                continue
-            
-            # PII detection
-            pii_entities = self.pii_detector.detect_pii(cleaned_text)
-            has_pii = len(pii_entities) > 0
-            
-            if has_pii and self.config.get('remove_pii', False):
-                processed.append({
-                    'text': None,
-                    'dropped': True,
-                    'drop_reason': 'pii_found',
+                    'text': cleaned_text,
+                    'dropped': False,
                     'language': lang,
                     'language_score': lang_score,
-                    'pii_count': len(pii_entities)
+                    'is_duplicate': is_duplicate,
+                    'has_pii': has_pii,
+                    'pii_count': len(pii_entities),
+                    'length': len(cleaned_text)
                 })
-                continue
-            
-            # Add to processed data
-            processed.append({
-                'text': cleaned_text,
-                'dropped': False,
-                'language': lang,
-                'language_score': lang_score,
-                'is_duplicate': is_duplicate,
-                'has_pii': has_pii,
-                'pii_count': len(pii_entities),
-                'length': len(cleaned_text)
-            })
-        
+
+            logger.info(f"Processed {len(processed)} items")
+            return processed
+
+        # Parallel processing
+        processed = []
+        mode = (self.parallel_mode or 'process').lower()
+
+        if mode == 'process':
+            logger.info(f"Processing using multiprocessing with {self.workers} workers")
+            with multiprocessing.Pool(processes=self.workers, initializer=_worker_init, initargs=(self.config,)) as pool:
+                # imap preserves order and is memory-efficient
+                for result in tqdm(pool.imap(_process_text_worker, texts), total=len(texts), desc="Processing texts"):
+                    processed.append(result)
+
+        else:
+            # Threaded execution (shares interpreter state, avoids reloading models per process)
+            logger.info(f"Processing using threads with {self.workers} workers")
+            def _thread_worker(text: str) -> Dict:
+                cleaned_text, drop_reason = self.cleaner.clean_text(text)
+                if cleaned_text is None:
+                    return {'text': None, 'dropped': True, 'drop_reason': drop_reason}
+
+                lang, lang_score = self.lang_detector.detect_language(cleaned_text)
+                allowed_langs = self.config.get('allowed_languages', None)
+                if allowed_langs and lang not in allowed_langs:
+                    return {
+                        'text': None,
+                        'dropped': True,
+                        'drop_reason': f'language_filtered_{lang}',
+                        'language': lang,
+                        'language_score': lang_score
+                    }
+
+                is_duplicate = self.dup_detector.is_duplicate(cleaned_text)
+                if is_duplicate and self.config.get('remove_duplicates', True):
+                    return {
+                        'text': None,
+                        'dropped': True,
+                        'drop_reason': 'duplicate',
+                        'language': lang,
+                        'language_score': lang_score
+                    }
+
+                pii_entities = self.pii_detector.detect_pii(cleaned_text)
+                has_pii = len(pii_entities) > 0
+                if has_pii and self.config.get('remove_pii', False):
+                    return {
+                        'text': None,
+                        'dropped': True,
+                        'drop_reason': 'pii_found',
+                        'language': lang,
+                        'language_score': lang_score,
+                        'pii_count': len(pii_entities)
+                    }
+
+                return {
+                    'text': cleaned_text,
+                    'dropped': False,
+                    'language': lang,
+                    'language_score': lang_score,
+                    'is_duplicate': is_duplicate,
+                    'has_pii': has_pii,
+                    'pii_count': len(pii_entities),
+                    'length': len(cleaned_text)
+                }
+
+            with ThreadPoolExecutor(max_workers=self.workers) as ex:
+                futures = [ex.submit(_thread_worker, t) for t in texts]
+                for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing texts"):
+                    try:
+                        processed.append(fut.result())
+                    except Exception as e:
+                        logger.error(f"Worker failed: {e}")
+
         logger.info(f"Processed {len(processed)} items")
         return processed
     
@@ -354,6 +526,25 @@ class Pipeline:
         self.inspector.generate_report()
         
         logger.info("Inspection reports generated")
+        # Try to execute the report notebook so outputs (plots/tables) are embedded
+        try:
+            # Import locally so pipeline module import won't fail if nbformat isn't installed
+            import nbformat
+            from nbconvert.preprocessors import ExecutePreprocessor
+
+            reports_dir = Path(self.config.get('reports_dir', 'data/reports'))
+            nb_path = reports_dir / 'pipeline_report_notebook.ipynb'
+            if nb_path.exists():
+                try:
+                    nb = nbformat.read(str(nb_path), as_version=4)
+                    ep = ExecutePreprocessor(timeout=600, kernel_name='python3')
+                    ep.preprocess(nb, {'metadata': {'path': str(reports_dir)}})
+                    nbformat.write(nb, str(nb_path))
+                    logger.info(f"Executed notebook and wrote outputs to {nb_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to execute notebook {nb_path}: {e}")
+        except Exception as e:
+            logger.debug(f"Notebook execution skipped: {e}")
     
     def export_data(self, tokenized_data: List[Dict]):
         """

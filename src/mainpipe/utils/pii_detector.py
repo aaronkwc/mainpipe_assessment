@@ -18,7 +18,7 @@ except ImportError:
 class PIIDetector:
     """Handles PII (Personally Identifiable Information) detection."""
     
-    def __init__(self, language: str = "en", score_threshold: float = 0.5):
+    def __init__(self, language: str = "en", score_threshold: float = 0.5, spacy_model: Optional[str] = None):
         """
         Initialize PII detector.
         
@@ -33,9 +33,52 @@ class PIIDetector:
             'total_pii_found': 0,
             'pii_types': {}
         }
-        
+        self.spacy_model = spacy_model
+
         if PRESIDIO_AVAILABLE:
-            self.analyzer = AnalyzerEngine()
+            # If a specific spaCy model is requested (e.g. for fast tests), try to ensure
+            # the model is installed before initializing Presidio's AnalyzerEngine. We
+            # call spaCy's download helper which will pip-install the model package.
+            if self.spacy_model:
+                try:
+                    # Import here to avoid hard dependency when PRESIDIO is not available
+                    import spacy.cli as spacy_cli
+                    import spacy
+
+                    logger.info(f"Ensuring spaCy model is available: {self.spacy_model}")
+                    try:
+                        # spacy.cli.download will skip or install as needed
+                        spacy_cli.download(self.spacy_model)
+                    except Exception as e:
+                        logger.warning(f"Failed to download spaCy model {self.spacy_model}: {e}")
+                    # Attempt to load the model and wrap it for Presidio so it uses the
+                    # configured model instead of falling back to en_core_web_lg.
+                    try:
+                        # Create a SpacyNlpEngine configured to use the requested model
+                        from presidio_analyzer.nlp_engine import SpacyNlpEngine
+
+                        nlp_engine = SpacyNlpEngine(models=[{"lang_code": self.language, "model_name": self.spacy_model}])
+                        # Load the spaCy model(s) now so Presidio won't attempt a download
+                        try:
+                            nlp_engine.load()
+                            self.analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
+                        except Exception as e:
+                            logger.warning(f"Failed to load SpacyNlpEngine with {self.spacy_model}: {e}")
+                            # Fall back to default AnalyzerEngine which will handle model loading
+                            self.analyzer = AnalyzerEngine()
+                    except Exception as e:
+                        logger.warning(f"Failed to configure SpacyNlpEngine: {e}")
+                        self.analyzer = AnalyzerEngine()
+                    except Exception as e:
+                        logger.warning(f"Failed to load spaCy model {self.spacy_model}: {e}")
+                except Exception:
+                    # If spacy itself isn't importable, we will proceed and let Presidio
+                    # raise if it needs spaCy at runtime.
+                    logger.debug("spaCy not importable in environment; skipping explicit model download")
+            # If analyzer wasn't created above (e.g. no spacy_model or load failed),
+            # create the default AnalyzerEngine here.
+            if getattr(self, 'analyzer', None) is None:
+                self.analyzer = AnalyzerEngine()
             self.anonymizer = AnonymizerEngine()
         else:
             self.analyzer = None
