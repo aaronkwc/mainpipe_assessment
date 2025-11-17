@@ -4,14 +4,14 @@
 data_dir: data/raw
 data_urls: []
 local_files:
-  - data/raw/sample.jsonl
+  - data/raw/mainpipe_data_v1.jsonl
 
 # Cleaning and normalization
 cleaning:
   min_length: 10
   max_length: 100000
-  remove_urls: false
-  remove_emails: false
+  remove_urls: true
+  remove_emails: true
 
 # Language filtering
 language: en
@@ -21,11 +21,12 @@ lang_confidence: 0.7
 
 # Duplicate detection
 remove_duplicates: true
-dup_method: exact
+dup_method: minhash
 
 # PII detection
-remove_pii: false
+redact_pii: true  # Redact PII by replacing entities with <TYPE> placeholders (e.g. <PERSON>, <EMAIL>)
 pii_threshold: 0.5
+inspect_pii: true
 # spaCy model to use for tests (small, faster). If set, pipeline will prefer threaded mode.
 spacy_model: en_core_web_sm
 
@@ -40,7 +41,7 @@ reports_dir: data/reports
 shard_size: 10000
 
 # Logging
-log_level: INFO
+log_level: DEBUG
 
 # Parallel and sample
 sample_size: 100

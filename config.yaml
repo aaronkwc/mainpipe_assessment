@@ -24,11 +24,23 @@ lang_confidence: 0.7
 
 # Duplicate detection
 remove_duplicates: true
-dup_method: exact  # exact, fuzzy, hash
+dup_method: minhash  # exact (SHA-256), minhash (Lee et al. 2022), hash
+# MinHash parameters (only used if dup_method=minhash)
+minhash_num_perm: 128        # Number of hash permutations (higher = more accurate, slower)
+minhash_threshold: 0.8       # Jaccard similarity threshold (0.8 = 80% similar)
+minhash_ngram_size: 5        # Character n-gram size (5 recommended for English)
 
 # PII detection
-remove_pii: false
+redact_pii: true  # Redact PII by replacing entities with <TYPE> placeholders (e.g. <PERSON>, <EMAIL>)
 pii_threshold: 0.5
+# inspect_pii controls whether to run PII detection for reporting/inspection
+# Set to false to skip PII detection entirely (much faster!)
+# Set to true to detect PII for reports even if not redacting it
+inspect_pii: true
+# Use smaller/faster spaCy model for PII detection (en_core_web_sm is 10x faster than en_core_web_lg)
+spacy_model: en_core_web_sm
+# pii_batch_size: Number of texts to process together in PII detection (higher = faster but more memory)
+pii_batch_size: 200
 
 # Tokenization
 tokenizer_type: bpe  # bpe, wordpiece, pretrained
@@ -47,9 +59,13 @@ log_level: INFO
 
 # Development/test helpers
 # Limit the number of texts processed for quick local tests. Set to null to process all.
-sample_size: 200
+sample_size: NULL
+# Process data in chunks to save memory and enable checkpointing
+# 10K chunks = ~27 chunks for 269K texts, checkpoint saved after each
+chunk_size: 10000
 # Number of workers to use for processing. Set to 1 to run single-threaded.
 workers: 4
 # parallel_mode: 'process' will use multiprocessing (may duplicate models per process).
 # parallel_mode: 'thread' will use threads (shares model instances, safer when spaCy/presidio are used).
-parallel_mode: thread
+# For large datasets without PII removal, 'process' is faster
+parallel_mode: process

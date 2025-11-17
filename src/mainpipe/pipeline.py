@@ -48,7 +48,12 @@ def _worker_init(config: Dict):
         score_threshold=config.get('pii_threshold', 0.5),
         spacy_model=config.get('spacy_model')
     )
-    _GLOBAL_DUP = DuplicateDetector(method=config.get('dup_method', 'exact'))
+    _GLOBAL_DUP = DuplicateDetector(
+        method=config.get('dup_method', 'exact'),
+        num_perm=config.get('minhash_num_perm', 128),
+        threshold=config.get('minhash_threshold', 0.8),
+        ngram_size=config.get('minhash_ngram_size', 5)
+    )
 
 
 def _process_text_worker(text: str) -> Dict:
@@ -86,17 +91,18 @@ def _process_text_worker(text: str) -> Dict:
             'language_score': lang_score
         }
 
-    pii_entities = _GLOBAL_PII.detect_pii(cleaned_text)
-    has_pii = len(pii_entities) > 0
-    if has_pii and _GLOBAL_CONFIG.get('remove_pii', False):
-        return {
-            'text': None,
-            'dropped': True,
-            'drop_reason': 'pii_found',
-            'language': lang,
-            'language_score': lang_score,
-            'pii_count': len(pii_entities)
-        }
+    # Only run PII detection if we're redacting PII or need it for inspection
+    # This is the slowest step, so skip if not needed
+    pii_entities = []
+    has_pii = False
+    pii_redacted = False
+    if _GLOBAL_CONFIG.get('redact_pii', False) or _GLOBAL_CONFIG.get('inspect_pii', True):
+        pii_entities = _GLOBAL_PII.detect_pii(cleaned_text)
+        has_pii = len(pii_entities) > 0
+        if has_pii and _GLOBAL_CONFIG.get('redact_pii', False):
+            # Redact PII by replacing entities with <TYPE> placeholders
+            cleaned_text = _GLOBAL_PII.redact_pii(cleaned_text, pii_entities)
+            pii_redacted = True
 
     return {
         'text': cleaned_text,
@@ -105,7 +111,9 @@ def _process_text_worker(text: str) -> Dict:
         'language_score': lang_score,
         'is_duplicate': is_duplicate,
         'has_pii': has_pii,
+        'pii_redacted': pii_redacted,
         'pii_count': len(pii_entities),
+        'pii_entities': pii_entities,
         'length': len(cleaned_text)
     }
 
@@ -168,7 +176,10 @@ class Pipeline:
         )
         
         self.dup_detector = DuplicateDetector(
-            method=config.get('dup_method', 'exact')
+            method=config.get('dup_method', 'exact'),
+            num_perm=config.get('minhash_num_perm', 128),
+            threshold=config.get('minhash_threshold', 0.8),
+            ngram_size=config.get('minhash_ngram_size', 5)
         )
         
         self.processed_data = []
@@ -306,16 +317,11 @@ class Pipeline:
 
                 pii_entities = self.pii_detector.detect_pii(cleaned_text)
                 has_pii = len(pii_entities) > 0
-                if has_pii and self.config.get('remove_pii', False):
-                    processed.append({
-                        'text': None,
-                        'dropped': True,
-                        'drop_reason': 'pii_found',
-                        'language': lang,
-                        'language_score': lang_score,
-                        'pii_count': len(pii_entities)
-                    })
-                    continue
+                pii_redacted = False
+                if has_pii and self.config.get('redact_pii', False):
+                    # Redact PII by replacing entities with <TYPE> placeholders
+                    cleaned_text = self.pii_detector.redact_pii(cleaned_text, pii_entities)
+                    pii_redacted = True
 
                 processed.append({
                     'text': cleaned_text,
@@ -324,7 +330,9 @@ class Pipeline:
                     'language_score': lang_score,
                     'is_duplicate': is_duplicate,
                     'has_pii': has_pii,
+                    'pii_redacted': pii_redacted,
                     'pii_count': len(pii_entities),
+                    'pii_entities': pii_entities,
                     'length': len(cleaned_text)
                 })
 
@@ -371,17 +379,18 @@ class Pipeline:
                         'language_score': lang_score
                     }
 
-                pii_entities = self.pii_detector.detect_pii(cleaned_text)
-                has_pii = len(pii_entities) > 0
-                if has_pii and self.config.get('remove_pii', False):
-                    return {
-                        'text': None,
-                        'dropped': True,
-                        'drop_reason': 'pii_found',
-                        'language': lang,
-                        'language_score': lang_score,
-                        'pii_count': len(pii_entities)
-                    }
+                # Only run PII detection if we're redacting PII or need it for inspection
+                # This is the slowest step, so skip if not needed
+                pii_entities = []
+                has_pii = False
+                pii_redacted = False
+                if self.config.get('redact_pii', False) or self.config.get('inspect_pii', True):
+                    pii_entities = self.pii_detector.detect_pii(cleaned_text)
+                    has_pii = len(pii_entities) > 0
+                    if has_pii and self.config.get('redact_pii', False):
+                        # Redact PII by replacing entities with <TYPE> placeholders
+                        cleaned_text = self.pii_detector.redact_pii(cleaned_text, pii_entities)
+                        pii_redacted = True
 
                 return {
                     'text': cleaned_text,
@@ -390,7 +399,9 @@ class Pipeline:
                     'language_score': lang_score,
                     'is_duplicate': is_duplicate,
                     'has_pii': has_pii,
+                    'pii_redacted': pii_redacted,
                     'pii_count': len(pii_entities),
+                    'pii_entities': pii_entities,
                     'length': len(cleaned_text)
                 }
 
@@ -403,6 +414,24 @@ class Pipeline:
                         logger.error(f"Worker failed: {e}")
 
         logger.info(f"Processed {len(processed)} items")
+        
+        # Post-process: Run PII detection in batch if needed (much faster than per-text)
+        # Only run if inspect_pii is enabled and we haven't already detected during processing
+        if self.config.get('inspect_pii', True) and not self.config.get('redact_pii', False):
+            logger.info("Running batch PII detection for inspection...")
+            valid_items = [item for item in processed if not item.get('dropped', False)]
+            if valid_items:
+                texts_for_pii = [item['text'] for item in valid_items]
+                batch_size = self.config.get('pii_batch_size', 50)
+                pii_results = self.pii_detector.detect_pii_batch(texts_for_pii, batch_size=batch_size)
+                
+                # Update items with PII information
+                for item, pii_entities in zip(valid_items, pii_results):
+                    item['has_pii'] = len(pii_entities) > 0
+                    item['pii_count'] = len(pii_entities)
+                    
+                logger.info(f"Batch PII detection complete for {len(valid_items)} items")
+        
         return processed
     
     def tokenize_data(self, processed_data: List[Dict]) -> List[Dict]:
@@ -460,10 +489,17 @@ class Pipeline:
         """
         logger.info("Generating inspection reports...")
         
-        # Collect statistics
+        # Collect statistics from processed data directly (more reliable than component stats in chunked processing)
+        lengths_after = [item['length'] for item in processed_data if not item.get('dropped', False) and 'length' in item]
+        
+        # Calculate drop reasons from processed data instead of cleaner stats (which may be empty in parallel processing)
+        drop_reasons = {}
+        for item in processed_data:
+            if item.get('dropped', False) and 'drop_reason' in item:
+                reason = item['drop_reason']
+                drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
+        
         lengths_before = self.cleaner.get_stats().get('length_before', [])
-        lengths_after = self.cleaner.get_stats().get('length_after', [])
-        drop_reasons = self.cleaner.get_stats().get('drop_reasons', {})
         
         # Length analysis
         if lengths_after:
@@ -507,44 +543,82 @@ class Pipeline:
         if dup_markers:
             self.inspector.analyze_duplicates(dup_markers)
         
-        # PII analysis
-        pii_stats = self.pii_detector.get_stats()
-        pii_hits = pii_stats.get('pii_types', {})
-        if pii_hits:
-            self.inspector.analyze_pii_hits(pii_hits)
+        # PII analysis - calculate from processed_data in parallel mode
+        # Aggregate PII stats from processed data instead of detector stats (which may be empty in parallel)
+        pii_type_counts = {}
+        total_with_pii = 0
+        for item in processed_data:
+            if not item.get('dropped', False) and item.get('has_pii', False):
+                total_with_pii += 1
+                # If we have pii_entities in the item, count them by type
+                if 'pii_entities' in item:
+                    for entity in item['pii_entities']:
+                        entity_type = entity.get('type', 'UNKNOWN')
+                        pii_type_counts[entity_type] = pii_type_counts.get(entity_type, 0) + 1
         
-        # Combine all stats
-        self.pipeline_stats.update(self.cleaner.get_stats())
+        # If we have PII data, analyze it
+        if pii_type_counts:
+            self.inspector.analyze_pii_hits(pii_type_counts)
+        
+        # Combine all stats from components
+        # Note: cleaner and pii_detector stats may be empty in parallel/chunked processing
         self.pipeline_stats.update(self.lang_detector.get_stats())
         self.pipeline_stats.update(self.dup_detector.get_stats())
-        self.pipeline_stats.update(self.pii_detector.get_stats())
+        # Skip pii_detector.get_stats() as it's empty in parallel mode - inspector has the PII stats
         self.pipeline_stats.update(self.tokenizer.get_stats())
         self.pipeline_stats.update(self.inspector.get_stats())
+        
+        # Calculate accurate statistics from actual processed data
+        # This is essential for chunked/parallel processing where component stats are incomplete
+        total_texts = len(processed_data)
+        dropped_texts = sum(1 for item in processed_data if item.get('dropped', False))
+        retained_texts = total_texts - dropped_texts
+        
+        self.pipeline_stats['total_samples'] = total_texts
+        self.pipeline_stats['total_processed'] = total_texts
+        self.pipeline_stats['cleaned_text_count'] = retained_texts
+        self.pipeline_stats['total_dropped'] = dropped_texts
+        
+        # Calculate drop reasons from processed data
+        drop_reasons_from_data = {}
+        for item in processed_data:
+            if item.get('dropped', False) and 'drop_reason' in item:
+                reason = item['drop_reason']
+                drop_reasons_from_data[reason] = drop_reasons_from_data.get(reason, 0) + 1
+        # Always set drop_reasons, even if empty
+        self.pipeline_stats['drop_reasons'] = drop_reasons_from_data
+        
+        # For now, use cleaner stats for length_before if available
+        cleaner_stats = self.cleaner.get_stats()
+        if cleaner_stats.get('length_before'):
+            self.pipeline_stats['length_before'] = cleaner_stats['length_before']
+        else:
+            self.pipeline_stats['length_before'] = []
+        
+        # Calculate length statistics from processed data
+        lengths_from_data = [item.get('length', 0) for item in processed_data if not item.get('dropped', False) and item.get('length')]
+        # Always set length_after, even if empty
+        self.pipeline_stats['length_after'] = lengths_from_data
+        
+        if lengths_from_data:
+            self.pipeline_stats['cleaned_text_count'] = len(lengths_from_data)
+            self.pipeline_stats['cleaned_text_min'] = min(lengths_from_data)
+            self.pipeline_stats['cleaned_text_max'] = max(lengths_from_data)
+            self.pipeline_stats['cleaned_text_mean'] = sum(lengths_from_data) / len(lengths_from_data)
+            self.pipeline_stats['cleaned_text_median'] = sorted(lengths_from_data)[len(lengths_from_data) // 2]
+        else:
+            # Set defaults if no lengths available
+            self.pipeline_stats['cleaned_text_count'] = 0
+            self.pipeline_stats['cleaned_text_min'] = 0
+            self.pipeline_stats['cleaned_text_max'] = 0
+            self.pipeline_stats['cleaned_text_mean'] = 0
+            self.pipeline_stats['cleaned_text_median'] = 0
         
         # Generate report
         self.inspector.stats = self.pipeline_stats
         self.inspector.generate_report()
         
         logger.info("Inspection reports generated")
-        # Try to execute the report notebook so outputs (plots/tables) are embedded
-        try:
-            # Import locally so pipeline module import won't fail if nbformat isn't installed
-            import nbformat
-            from nbconvert.preprocessors import ExecutePreprocessor
-
-            reports_dir = Path(self.config.get('reports_dir', 'data/reports'))
-            nb_path = reports_dir / 'pipeline_report_notebook.ipynb'
-            if nb_path.exists():
-                try:
-                    nb = nbformat.read(str(nb_path), as_version=4)
-                    ep = ExecutePreprocessor(timeout=600, kernel_name='python3')
-                    ep.preprocess(nb, {'metadata': {'path': str(reports_dir)}})
-                    nbformat.write(nb, str(nb_path))
-                    logger.info(f"Executed notebook and wrote outputs to {nb_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to execute notebook {nb_path}: {e}")
-        except Exception as e:
-            logger.debug(f"Notebook execution skipped: {e}")
     
     def export_data(self, tokenized_data: List[Dict]):
         """
@@ -568,9 +642,380 @@ class Pipeline:
         
         logger.info("Data export complete")
     
+    def generate_html_report(self):
+        """
+        Generate an HTML report from pipeline statistics and charts.
+        """
+        logger.info("Generating HTML report...")
+        
+        try:
+            import base64
+            from datetime import datetime
+            
+            reports_dir = Path(self.config.get('reports_dir', 'data/reports'))
+            report_path = reports_dir / 'pipeline_report.json'
+            if not report_path.exists():
+                logger.warning("No pipeline_report.json found, skipping HTML generation")
+                return
+            
+            with open(report_path, 'r') as f:
+                stats = json.load(f)
+            
+            # Read chart images and convert to base64
+            charts = {}
+            chart_files = [
+                'text_lengths.png',
+                'token_lengths.png', 
+                'drop_reasons.png',
+                'language_scores.png',
+                'duplicates.png',
+                'pii_hits.png'
+            ]
+            
+            for chart_file in chart_files:
+                chart_path = reports_dir / chart_file
+                if chart_path.exists():
+                    with open(chart_path, 'rb') as f:
+                        encoded = base64.b64encode(f.read()).decode('utf-8')
+                        charts[chart_file] = f"data:image/png;base64,{encoded}"
+            
+            # Generate HTML
+            html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MainPipe Pipeline Report</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            margin: 0 0 10px 0;
+            font-size: 2.5em;
+        }}
+        .timestamp {{
+            opacity: 0.9;
+            font-size: 0.9em;
+        }}
+        .section {{
+            background: white;
+            padding: 25px;
+            margin-bottom: 25px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        h2 {{
+            color: #667eea;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+            margin-top: 0;
+        }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .stat-card {{
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }}
+        .stat-value {{
+            font-size: 2em;
+            font-weight: bold;
+            color: #667eea;
+            margin: 10px 0;
+        }}
+        .stat-label {{
+            color: #666;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        .chart {{
+            margin: 20px 0;
+            text-align: center;
+        }}
+        .chart img {{
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }}
+        .chart-title {{
+            font-size: 1.2em;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #444;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }}
+        th, td {{
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }}
+        th {{
+            background: #667eea;
+            color: white;
+            font-weight: 600;
+        }}
+        tr:hover {{
+            background: #f5f5f5;
+        }}
+        .summary-box {{
+            background: #e8f4f8;
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }}
+        .footer {{
+            text-align: center;
+            color: #888;
+            padding: 20px;
+            margin-top: 40px;
+            border-top: 2px solid #ddd;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 MainPipe Pipeline Report</h1>
+        <div class="timestamp">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+    </div>
+
+    <div class="section">
+        <h2>📈 Overview Statistics</h2>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Samples</div>
+                <div class="stat-value">{stats.get('total_samples', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Texts Retained</div>
+                <div class="stat-value">{stats.get('cleaned_text_count', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Texts Dropped</div>
+                <div class="stat-value">{stats.get('total_dropped', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Tokenized Sequences</div>
+                <div class="stat-value">{stats.get('total_sequences', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Tokens</div>
+                <div class="stat-value">{stats.get('total_tokens', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Avg Sequence Length</div>
+                <div class="stat-value">{stats.get('avg_sequence_length', 0):.1f}</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>📝 Text Length Statistics</h2>
+        <div class="summary-box">
+            <strong>After Cleaning:</strong>
+            Min: {stats.get('cleaned_text_min', 0):,} | 
+            Max: {stats.get('cleaned_text_max', 0):,} | 
+            Mean: {stats.get('cleaned_text_mean', 0):.1f} | 
+            Median: {stats.get('cleaned_text_median', 0):.1f}
+        </div>
+        {'<div class="chart"><div class="chart-title">Text Length Distribution</div><img src="' + charts.get('text_lengths.png', '') + '" alt="Text Lengths"></div>' if 'text_lengths.png' in charts else ''}
+    </div>
+
+    <div class="section">
+        <h2>🔤 Token Statistics</h2>
+        <div class="summary-box">
+            Min: {stats.get('token_min', 0):,} | 
+            Max: {stats.get('token_max', 0):,} | 
+            Mean: {stats.get('token_mean', 0):.1f} | 
+            Median: {stats.get('token_median', 0):.1f}
+        </div>
+        {'<div class="chart"><div class="chart-title">Token Length Distribution</div><img src="' + charts.get('token_lengths.png', '') + '" alt="Token Lengths"></div>' if 'token_lengths.png' in charts else ''}
+    </div>
+
+    <div class="section">
+        <h2>❌ Drop Reasons</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Reason</th>
+                    <th>Count</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+            
+            drop_reasons = stats.get('drop_reasons', {})
+            for reason, count in drop_reasons.items():
+                html += f"""                <tr>
+                    <td>{reason}</td>
+                    <td>{count:,}</td>
+                </tr>
+"""
+            
+            html += """            </tbody>
+        </table>
+"""
+            if 'drop_reasons.png' in charts:
+                html += f"""        <div class="chart">
+            <div class="chart-title">Drop Reasons Visualization</div>
+            <img src="{charts['drop_reasons.png']}" alt="Drop Reasons">
+        </div>
+"""
+            
+            html += """    </div>
+
+    <div class="section">
+        <h2>🌍 Language Detection</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Language</th>
+                    <th>Count</th>
+                    <th>Mean Score</th>
+                    <th>Median Score</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+            
+            languages = stats.get('languages', {})
+            for lang, count in sorted(languages.items(), key=lambda x: x[1], reverse=True):
+                mean_score = stats.get(f'{lang}_mean_score', 0)
+                median_score = stats.get(f'{lang}_median_score', 0)
+                html += f"""                <tr>
+                    <td><strong>{lang.upper()}</strong></td>
+                    <td>{count:,}</td>
+                    <td>{mean_score:.4f}</td>
+                    <td>{median_score:.4f}</td>
+                </tr>
+"""
+            
+            html += """            </tbody>
+        </table>
+"""
+            if 'language_scores.png' in charts:
+                html += f"""        <div class="chart">
+            <div class="chart-title">Language Detection Scores</div>
+            <img src="{charts['language_scores.png']}" alt="Language Scores">
+        </div>
+"""
+            
+            html += """    </div>
+
+    <div class="section">
+        <h2>🔍 PII Detection</h2>
+        <div class="summary-box">
+            <strong>Total PII Instances Found:</strong> """ + f"{stats.get('total_pii_hits', 0):,}" + """
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>PII Type</th>
+                    <th>Count</th>
+                    <th>Hit Rate</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+            
+            pii_counts = stats.get('pii_type_counts', {})
+            for pii_type, count in sorted(pii_counts.items(), key=lambda x: x[1], reverse=True):
+                hit_rate = stats.get(f'{pii_type}_hit_rate', 0) * 100
+                html += f"""                <tr>
+                    <td><strong>{pii_type}</strong></td>
+                    <td>{count:,}</td>
+                    <td>{hit_rate:.2f}%</td>
+                </tr>
+"""
+            
+            html += """            </tbody>
+        </table>
+"""
+            if 'pii_hits.png' in charts:
+                html += f"""        <div class="chart">
+            <div class="chart-title">PII Detection Results</div>
+            <img src="{charts['pii_hits.png']}" alt="PII Hits">
+        </div>
+"""
+            
+            html += """    </div>
+
+    <div class="section">
+        <h2>🔄 Duplicate Detection</h2>
+        <div class="summary-box">
+            <strong>Duplicates Found:</strong> """ + f"{stats.get('duplicate_count', 0):,}" + """ | 
+            <strong>Unique Items:</strong> """ + f"{stats.get('unique_count', 0):,}" + """ | 
+            <strong>Duplicate Rate:</strong> """ + f"{stats.get('duplicate_rate', 0) * 100:.2f}%" + """
+        </div>
+"""
+            if 'duplicates.png' in charts:
+                html += f"""        <div class="chart">
+            <div class="chart-title">Duplicate Analysis</div>
+            <img src="{charts['duplicates.png']}" alt="Duplicates">
+        </div>
+"""
+            
+            html += """    </div>
+
+    <div class="footer">
+        <p>Generated by MainPipe Data Processing Pipeline</p>
+    </div>
+</body>
+</html>
+"""
+            
+            # Save HTML report
+            html_path = reports_dir / 'pipeline_report.html'
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+            
+            logger.info(f"HTML report generated: {html_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate HTML report: {e}", exc_info=True)
+    
+    def _save_checkpoint(self, processed_data: List[Dict], checkpoint_path: Path):
+        """
+        Save intermediate processing checkpoint.
+        
+        Args:
+            processed_data: Processed data to save
+            checkpoint_path: Path to save checkpoint
+        """
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(checkpoint_path, 'w', encoding='utf-8') as f:
+            for item in processed_data:
+                f.write(json.dumps(item) + '\n')
+    
     def run(self):
         """
-        Run the complete pipeline end-to-end.
+        Run the complete pipeline end-to-end with chunked processing for scalability.
         """
         logger.info("Starting pipeline execution...")
         
@@ -589,8 +1034,60 @@ class Pipeline:
                 logger.error("No texts loaded from files")
                 return
             
-            # Step 3: Process data
-            processed_data = self.process_data(texts)
+            # Step 3: Process data in chunks if chunk_size is specified
+            chunk_size = self.config.get('chunk_size', None)
+            
+            if chunk_size and len(texts) > chunk_size:
+                logger.info(f"Processing {len(texts)} texts in chunks of {chunk_size}...")
+                processed_data = []
+                
+                # Check for existing checkpoints to resume from
+                output_dir = Path(self.config.get('output_dir', 'data/processed'))
+                resume_file = output_dir / 'resume_state.json'
+                start_chunk = 0
+                
+                if resume_file.exists():
+                    with open(resume_file, 'r') as f:
+                        resume_state = json.load(f)
+                        start_chunk = resume_state.get('last_completed_chunk', 0) + 1
+                        logger.info(f"Resuming from chunk {start_chunk + 1}")
+                        
+                        # Load existing checkpoints
+                        for i in range(start_chunk):
+                            checkpoint_path = output_dir / f'checkpoint_{i + 1}.jsonl'
+                            if checkpoint_path.exists():
+                                with open(checkpoint_path, 'r') as cf:
+                                    for line in cf:
+                                        processed_data.append(json.loads(line))
+                        logger.info(f"Loaded {len(processed_data)} items from previous checkpoints")
+                
+                total_chunks = (len(texts) + chunk_size - 1) // chunk_size
+                for chunk_idx in range(start_chunk, total_chunks):
+                    i = chunk_idx * chunk_size
+                    chunk_end = min(i + chunk_size, len(texts))
+                    chunk_texts = texts[i:chunk_end]
+                    logger.info(f"Processing chunk {chunk_idx + 1}/{total_chunks} ({i+1}-{chunk_end}/{len(texts)})")
+                    
+                    chunk_processed = self.process_data(chunk_texts)
+                    processed_data.extend(chunk_processed)
+                    
+                    # Save checkpoint and update resume state
+                    checkpoint_path = output_dir / f'checkpoint_{chunk_idx + 1}.jsonl'
+                    self._save_checkpoint(chunk_processed, checkpoint_path)
+                    
+                    # Update resume state
+                    with open(resume_file, 'w') as f:
+                        json.dump({'last_completed_chunk': chunk_idx, 'total_chunks': total_chunks}, f)
+                    
+                    logger.info(f"Checkpoint {chunk_idx + 1} saved. Safe to stop/resume.")
+                
+                # Clean up resume file when complete
+                if resume_file.exists():
+                    resume_file.unlink()
+                    logger.info("All chunks processed. Resume file cleaned up.")
+            else:
+                # Process all at once if no chunking
+                processed_data = self.process_data(texts)
             
             # Step 4: Tokenize data
             tokenized_data = self.tokenize_data(processed_data)
@@ -601,6 +1098,9 @@ class Pipeline:
             # Step 6: Export data
             if tokenized_data:
                 self.export_data(tokenized_data)
+            
+            # Step 7: Generate HTML report
+            self.generate_html_report()
             
             logger.info("Pipeline execution complete!")
             logger.info(f"Pipeline statistics: {self.pipeline_stats}")
