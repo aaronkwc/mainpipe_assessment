@@ -32,7 +32,7 @@ class DuplicateDetector:
         
         # MinHash LSH structures
         if method == "minhash":
-            self.lsh_bands = defaultdict(set)  # band_id -> set of signature hashes
+            self.lsh_bands = defaultdict(lambda: defaultdict(set))  # band_id -> band_hash -> set of doc hashes
             self.doc_signatures = {}  # doc_hash -> MinHash signature
             self.num_bands = 16  # Number of LSH bands
             self.rows_per_band = num_perm // self.num_bands
@@ -142,10 +142,8 @@ class DuplicateDetector:
         candidate_docs = set()
         for band_idx, band_hash in enumerate(band_hashes):
             if band_hash in self.lsh_bands[band_idx]:
-                # Found potential duplicate, need to verify
-                for doc_hash in self.lsh_bands[band_idx]:
-                    if doc_hash != band_hash:  # Skip self
-                        candidate_docs.add(doc_hash)
+                # Found potential duplicates in this band
+                candidate_docs.update(self.lsh_bands[band_idx][band_hash])
         
         # Verify candidates with actual Jaccard similarity
         doc_hash = self.compute_hash(text)
@@ -163,7 +161,7 @@ class DuplicateDetector:
         # Not a duplicate, add to LSH bands
         self.doc_signatures[doc_hash] = signature
         for band_idx, band_hash in enumerate(band_hashes):
-            self.lsh_bands[band_idx].add(band_hash)
+            self.lsh_bands[band_idx][band_hash].add(doc_hash)
         
         return False
     

@@ -87,6 +87,7 @@ def _process_text_worker(text: str) -> Dict:
             'text': None,
             'dropped': True,
             'drop_reason': 'duplicate',
+            'is_duplicate': True,
             'language': lang,
             'language_score': lang_score
         }
@@ -310,6 +311,7 @@ class Pipeline:
                         'text': None,
                         'dropped': True,
                         'drop_reason': 'duplicate',
+                        'is_duplicate': True,
                         'language': lang,
                         'language_score': lang_score
                     })
@@ -375,6 +377,7 @@ class Pipeline:
                         'text': None,
                         'dropped': True,
                         'drop_reason': 'duplicate',
+                        'is_duplicate': True,
                         'language': lang,
                         'language_score': lang_score
                     }
@@ -538,8 +541,13 @@ class Pipeline:
         if lang_scores:
             self.inspector.analyze_language_scores(lang_scores)
         
-        # Duplicate analysis
-        dup_markers = [item.get('is_duplicate', False) for item in processed_data]
+        # Duplicate analysis - only include items that made it to duplicate detection
+        # (exclude items already dropped for language, length, etc.)
+        dup_markers = [
+            item.get('is_duplicate', False) 
+            for item in processed_data 
+            if item.get('language') is not None  # Only items that passed language detection
+        ]
         if dup_markers:
             self.inspector.analyze_duplicates(dup_markers)
         

@@ -3,7 +3,10 @@ Language detection utilities.
 """
 from typing import Dict, Optional, Tuple
 import logging
-from langdetect import detect, detect_langs, LangDetectException
+from langdetect import detect, detect_langs, LangDetectException, DetectorFactory
+
+# Set seed for reproducible language detection
+DetectorFactory.seed = 0
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,13 @@ class LanguageDetector:
             'detection_failures': 0,
             'languages': {}
         }
+        
+        # Initialize detector by running a dummy detection to load profiles
+        # This prevents "Need to load profiles" error in multi-threading
+        try:
+            detect("This is a test sentence to initialize the language detector.")
+        except:
+            pass
     
     def detect_language(self, text: str) -> Tuple[Optional[str], Optional[float]]:
         """
@@ -58,7 +68,7 @@ class LanguageDetector:
                 return None, None
                 
         except LangDetectException as e:
-            logger.debug(f"Language detection failed: {e}")
+            logger.warning(f"Language detection failed for text (len={len(text)}): {e}")
             self.stats['detection_failures'] += 1
             return None, None
     

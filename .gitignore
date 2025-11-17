@@ -210,5 +210,6 @@ __marimo__/
 data/raw/
 data/processed/
 data/reports/
+data/archived_runs/
 *.log
 pipeline.log

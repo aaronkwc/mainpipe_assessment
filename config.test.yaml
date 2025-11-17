@@ -4,7 +4,7 @@
 data_dir: data/raw
 data_urls: []
 local_files:
-  - data/raw/mainpipe_data_v1.jsonl
+  - data/raw/test_duplicates.jsonl
 
 # Cleaning and normalization
 cleaning:
@@ -44,6 +44,6 @@ shard_size: 10000
 log_level: DEBUG
 
 # Parallel and sample
-sample_size: 100
+sample_size: NULL
 workers: 4
 parallel_mode: thread
