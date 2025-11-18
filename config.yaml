@@ -34,8 +34,6 @@ pii_threshold: 0.5
 # inspect_pii controls whether to run PII detection for reporting/inspection
 # Set to false to skip PII detection entirely (much faster!)
 inspect_pii: false
-# Set to true to detect PII for reports even if not redacting it
-inspect_pii: true
 # Use smaller/faster spaCy model for PII detection (en_core_web_sm is 10x faster than en_core_web_lg)
 spacy_model: en_core_web_sm
 # pii_batch_size: Number of texts to process together in PII detection (higher = faster but more memory)
@@ -58,15 +56,15 @@ log_level: INFO
 
 # Development/test helpers
 # Limit the number of texts processed for quick local tests. Set to null to process all.
-sample_size: NULL
+sample_size: 10000
 # Process data in chunks to save memory and enable checkpointing
 # 10K chunks = ~27 chunks for 269K texts, checkpoint saved after each
-chunk_size: 10000
+chunk_size: 2000
 # Number of workers to use for processing. Set to 1 to run single-threaded.
 # For thread mode, can use more workers (e.g., 8-16) since threads are lightweight
-workers: 8
+workers: 4
 # parallel_mode: 'process' will use multiprocessing (may duplicate models per process).
 # parallel_mode: 'thread' will use threads (shares model instances, safer when spaCy/presidio are used).
 # For large datasets without PII removal, 'process' is faster
 # IMPORTANT: Use 'thread' for duplicate detection to work across chunks
-parallel_mode: thread
+parallel_mode: process

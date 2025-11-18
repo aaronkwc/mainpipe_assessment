@@ -43,11 +43,17 @@ def _worker_init(config: Dict):
     _GLOBAL_CONFIG = config
     _GLOBAL_CLEANER = DataCleaner(config=config.get('cleaning', {}))
     _GLOBAL_LANG = LanguageDetector(confidence_threshold=config.get('lang_confidence', 0.7))
-    _GLOBAL_PII = PIIDetector(
-        language=config.get('language', 'en'),
-        score_threshold=config.get('pii_threshold', 0.5),
-        spacy_model=config.get('spacy_model')
-    )
+    
+    # Only initialize PII detector if needed (this is expensive!)
+    if config.get('redact_pii', False) or config.get('inspect_pii', True):
+        _GLOBAL_PII = PIIDetector(
+            language=config.get('language', 'en'),
+            score_threshold=config.get('pii_threshold', 0.5),
+            spacy_model=config.get('spacy_model')
+        )
+    else:
+        _GLOBAL_PII = None
+    
     _GLOBAL_DUP = DuplicateDetector(
         method=config.get('dup_method', 'exact'),
         num_perm=config.get('minhash_num_perm', 128),
@@ -81,23 +87,15 @@ def _process_text_worker(text: str) -> Dict:
             'language_score': lang_score
         }
 
-    is_duplicate = _GLOBAL_DUP.is_duplicate(cleaned_text)
-    if is_duplicate and _GLOBAL_CONFIG.get('remove_duplicates', True):
-        return {
-            'text': None,
-            'dropped': True,
-            'drop_reason': 'duplicate',
-            'is_duplicate': True,
-            'language': lang,
-            'language_score': lang_score
-        }
+    # Skip dedup in worker - will be done in post-processing pass for process mode
+    # This allows proper cross-chunk dedup without IPC overhead
 
     # Only run PII detection if we're redacting PII or need it for inspection
     # This is the slowest step, so skip if not needed
     pii_entities = []
     has_pii = False
     pii_redacted = False
-    if _GLOBAL_CONFIG.get('redact_pii', False) or _GLOBAL_CONFIG.get('inspect_pii', True):
+    if _GLOBAL_PII is not None and (_GLOBAL_CONFIG.get('redact_pii', False) or _GLOBAL_CONFIG.get('inspect_pii', True)):
         pii_entities = _GLOBAL_PII.detect_pii(cleaned_text)
         has_pii = len(pii_entities) > 0
         if has_pii and _GLOBAL_CONFIG.get('redact_pii', False):
@@ -110,7 +108,6 @@ def _process_text_worker(text: str) -> Dict:
         'dropped': False,
         'language': lang,
         'language_score': lang_score,
-        'is_duplicate': is_duplicate,
         'has_pii': has_pii,
         'pii_redacted': pii_redacted,
         'pii_count': len(pii_entities),
@@ -170,11 +167,15 @@ class Pipeline:
             self.parallel_mode = 'thread' if config.get('spacy_model') else 'process'
         self.sample_size = config.get('sample_size', None)
 
-        self.pii_detector = PIIDetector(
-            language=config.get('language', 'en'),
-            score_threshold=config.get('pii_threshold', 0.5),
-            spacy_model=config.get('spacy_model')
-        )
+        # Only initialize PII detector if needed (this is expensive!)
+        if config.get('redact_pii', False) or config.get('inspect_pii', True):
+            self.pii_detector = PIIDetector(
+                language=config.get('language', 'en'),
+                score_threshold=config.get('pii_threshold', 0.5),
+                spacy_model=config.get('spacy_model')
+            )
+        else:
+            self.pii_detector = None
         
         self.dup_detector = DuplicateDetector(
             method=config.get('dup_method', 'exact'),
@@ -317,13 +318,16 @@ class Pipeline:
                     })
                     continue
 
-                pii_entities = self.pii_detector.detect_pii(cleaned_text)
-                has_pii = len(pii_entities) > 0
+                pii_entities = []
+                has_pii = False
                 pii_redacted = False
-                if has_pii and self.config.get('redact_pii', False):
-                    # Redact PII by replacing entities with <TYPE> placeholders
-                    cleaned_text = self.pii_detector.redact_pii(cleaned_text, pii_entities)
-                    pii_redacted = True
+                if self.pii_detector is not None:
+                    pii_entities = self.pii_detector.detect_pii(cleaned_text)
+                    has_pii = len(pii_entities) > 0
+                    if has_pii and self.config.get('redact_pii', False):
+                        # Redact PII by replacing entities with <TYPE> placeholders
+                        cleaned_text = self.pii_detector.redact_pii(cleaned_text, pii_entities)
+                        pii_redacted = True
 
                 processed.append({
                     'text': cleaned_text,
@@ -387,7 +391,7 @@ class Pipeline:
                 pii_entities = []
                 has_pii = False
                 pii_redacted = False
-                if self.config.get('redact_pii', False) or self.config.get('inspect_pii', True):
+                if self.pii_detector is not None and (self.config.get('redact_pii', False) or self.config.get('inspect_pii', True)):
                     pii_entities = self.pii_detector.detect_pii(cleaned_text)
                     has_pii = len(pii_entities) > 0
                     if has_pii and self.config.get('redact_pii', False):
@@ -423,7 +427,7 @@ class Pipeline:
         if self.config.get('inspect_pii', True) and not self.config.get('redact_pii', False):
             logger.info("Running batch PII detection for inspection...")
             valid_items = [item for item in processed if not item.get('dropped', False)]
-            if valid_items:
+            if valid_items and self.pii_detector is not None:
                 texts_for_pii = [item['text'] for item in valid_items]
                 batch_size = self.config.get('pii_batch_size', 50)
                 pii_results = self.pii_detector.detect_pii_batch(texts_for_pii, batch_size=batch_size)
@@ -1096,6 +1100,25 @@ class Pipeline:
             else:
                 # Process all at once if no chunking
                 processed_data = self.process_data(texts)
+            
+            # Step 3.5: Run cross-chunk deduplication (after all chunks processed)
+            if self.parallel_mode == 'process' and self.config.get('remove_duplicates', True):
+                logger.info("Running cross-chunk duplicate detection...")
+                dedup_count = 0
+                for item in tqdm(processed_data, desc="Checking duplicates"):
+                    if item.get('dropped', False):
+                        continue
+                    text = item.get('text')
+                    if text:
+                        is_dup = self.dup_detector.is_duplicate(text)
+                        item['is_duplicate'] = is_dup
+                        if is_dup:
+                            item['dropped'] = True
+                            item['drop_reason'] = 'duplicate'
+                            dedup_count += 1
+                    else:
+                        item['is_duplicate'] = False
+                logger.info(f"Cross-chunk duplicate detection complete: {dedup_count} duplicates found")
             
             # Step 4: Tokenize data
             tokenized_data = self.tokenize_data(processed_data)
