@@ -106,6 +106,15 @@ docker compose run --rm mainpipe mainpipe run `
 
 # Note: --remove-duplicates false prevents re-running duplicate detection and 
 # preserves the deduplication statistics from Step 1
+
+# Step 3 (Optional): Reduce file size for submission (keeps only token_ids)
+# If the full tokenized_data.jsonl exceeds size limits, create a minimal version:
+docker compose run --rm mainpipe python /app/scripts/reduce_tokenized_data.py \
+  /app/data/processed/tokenized_data.jsonl \
+  /app/data/processed/tokenized_data_minimal.jsonl
+
+# This reduces file size by ~75% by keeping only token_ids
+# Original: ~1.5GB with all metadata → Minimal: ~378MB with token_ids only
 ```
 
 ## Pipeline Architecture
@@ -169,12 +178,14 @@ After running the pipeline, you'll find:
 data/
 ├── raw/              # Downloaded/input data
 ├── processed/        # Tokenized data and shards
-│   ├── tokenized_data.jsonl
+│   ├── tokenized_data.jsonl         # Full tokenized data with metadata
+│   ├── tokenized_data_minimal.jsonl # Minimal version (token_ids only)
 │   ├── shard_00000.jsonl
 │   ├── shard_00001.jsonl
 │   └── tokenizer.json
 └── reports/          # Analysis reports and visualizations
     ├── pipeline_report.json
+    ├── pipeline_report.html
     ├── text_lengths.png
     ├── token_lengths.png
     ├── drop_reasons.png
