@@ -673,6 +673,19 @@ class Pipeline:
             with open(report_path, 'r') as f:
                 stats = json.load(f)
             
+            # Load pre-processing deduplication stats if available
+            dedup_stats = None
+            data_dir = Path(self.config.get('data_dir', 'data/raw'))
+            dedup_stats_files = list(data_dir.glob('*_dedup_stats.json'))
+            if dedup_stats_files:
+                dedup_stats_path = dedup_stats_files[0]  # Use first match
+                try:
+                    with open(dedup_stats_path, 'r', encoding='utf-8-sig') as f:
+                        dedup_stats = json.load(f)
+                    logger.info(f"Loaded pre-processing dedup stats from {dedup_stats_path}")
+                except Exception as e:
+                    logger.warning(f"Error loading dedup stats: {e}")
+            
             # Read chart images and convert to base64
             charts = {}
             chart_files = [
@@ -846,7 +859,39 @@ class Pipeline:
             </div>
         </div>
     </div>
-
+"""
+            
+            # Add pre-processing deduplication section if stats available
+            if dedup_stats:
+                html += f"""
+    <div class="section">
+        <h2>🔄 Pre-Processing Deduplication</h2>
+        <div class="summary-box">
+            <p><strong>Note:</strong> Duplicates were removed during pre-processing using MinHash LSH (single-threaded). 
+            This ensures all duplicates are detected across the entire dataset before pipeline processing.</p>
+        </div>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Original Dataset</div>
+                <div class="stat-value">{dedup_stats.get('total', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Unique Texts Kept</div>
+                <div class="stat-value">{dedup_stats.get('unique', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Duplicates Removed</div>
+                <div class="stat-value">{dedup_stats.get('duplicates', 0):,}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Duplicate Rate</div>
+                <div class="stat-value">{dedup_stats.get('duplicate_rate', 0):.2f}%</div>
+            </div>
+        </div>
+    </div>
+"""
+            
+            html += f"""
     <div class="section">
         <h2>📝 Text Length Statistics</h2>
         <div class="summary-box">
@@ -869,7 +914,9 @@ class Pipeline:
         </div>
         {'<div class="chart"><div class="chart-title">Token Length Distribution</div><img src="' + charts.get('token_lengths.png', '') + '" alt="Token Lengths"></div>' if 'token_lengths.png' in charts else ''}
     </div>
-
+"""
+            
+            html += """
     <div class="section">
         <h2>❌ Drop Reasons</h2>
         <table>

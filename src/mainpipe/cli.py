@@ -35,14 +35,29 @@ def cli(ctx, verbose):
 @cli.command()
 @click.option('--config', '-c', required=True, type=click.Path(exists=True),
               help='Path to configuration YAML file')
+@click.option('--local-file', type=str, multiple=True,
+              help='Local file(s) to process (overrides config)')
+@click.option('--remove-duplicates', type=bool, default=None,
+              help='Enable/disable duplicate detection (overrides config)')
 @click.pass_context
-def run(ctx, config):
+def run(ctx, config, local_file, remove_duplicates):
     """Run the complete pipeline end-to-end."""
     logger = logging.getLogger(__name__)
     logger.info(f"Loading configuration from {config}")
     
     try:
         pipeline = Pipeline.from_config_file(config)
+        
+        # Apply command-line overrides
+        if local_file:
+            pipeline.config['local_files'] = list(local_file)
+            pipeline.config['data_urls'] = []  # Clear URLs when using local files
+            logger.info(f"Using local files: {list(local_file)}")
+        
+        if remove_duplicates is not None:
+            pipeline.config['remove_duplicates'] = remove_duplicates
+            logger.info(f"Duplicate detection: {remove_duplicates}")
+        
         pipeline.run()
         logger.info("Pipeline completed successfully!")
     except Exception as e:

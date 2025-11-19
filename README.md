@@ -52,24 +52,6 @@ Mainpipe is an end-to-end data processing pipeline that handles:
 
 ## Installation
 
-### Local Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/aaronkwc/mainpipe_assessment.git
-cd mainpipe_assessment
-
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install the package
-pip install -e .
-```
-
 ### Docker Installation
 
 ```bash
@@ -82,81 +64,60 @@ docker-compose build
 
 ## Usage
 
-### Configuration
-
-Create a `config.yaml` file (see `config.yaml` for a template):
-
-```yaml
-# Data sources
-data_dir: data/raw
-data_urls:
-  - https://example.com/dataset.jsonl
-local_files:
-  - data/raw/sample.txt
-
-# Processing parameters
-cleaning:
-  min_length: 50
-  max_length: 100000
-
-allowed_languages:
-  - en
-  - es
-
-remove_duplicates: true
-remove_pii: false
-
-# Tokenization
-tokenizer_type: bpe
-vocab_size: 30000
-train_tokenizer: true
-
-# Output settings
-output_dir: data/processed
-shard_size: 10000
-```
-
 ### Running the Pipeline
 
-#### Local Execution
+#### Pre-processing: Deduplication (Recommended First Step)
+
+Run deduplication as a separate pre-processing step before the main pipeline. This process uses MinHash LSH on a single thread so it can be slow.
 
 ```bash
-# Run the complete pipeline
-mainpipe run -c config.yaml
+# Step 1: Run standalone deduplication with MinHash (single-threaded, finds all duplicates)
+# Bash/Linux:
+docker compose run --rm mainpipe python /app/scripts/deduplicate_raw_data.py \
+  /app/data/raw/mainpipe_data_v1.jsonl \
+  /app/data/raw/mainpipe_data_v1_deduped.jsonl \
+  --threshold 0.8
 
-# Run individual steps
-mainpipe acquire -u https://example.com/data.jsonl -o data/raw
-mainpipe clean -i data/raw/data.jsonl -o data/cleaned
-mainpipe tokenize -i data/cleaned/cleaned.jsonl -o data/tokenized
-mainpipe inspect -i data/processed -o data/reports
-```
+# PowerShell (use backticks for line continuation):
+docker compose run --rm mainpipe python /app/scripts/deduplicate_raw_data.py `
+  /app/data/raw/mainpipe_data_v1.jsonl `
+  /app/data/raw/mainpipe_data_v1_deduped.jsonl `
+  --threshold 0.8
 
-#### Docker Execution
+# Optional parameters:
+#   --threshold: Jaccard similarity threshold (default: 0.8)
+#   --ngram-size: N-gram size for MinHash (default: 5)
+#   --num-perm: Number of permutations (default: 128)
+#   --min-length: Minimum text length (default: 50)
+#   --max-length: Maximum text length (default: 100000)
 
-```bash
-# Run with Docker Compose
-docker-compose up
+# Step 2: Run the main pipeline with the deduplicated file (disable duplicate detection)
+# Bash/Linux:
+docker compose run --rm mainpipe mainpipe run \
+  --local-file data/raw/mainpipe_data_v1_deduped.jsonl \
+  --remove-duplicates false \
+  -c config.yaml
 
-# Or run with Docker directly
-docker run -v $(pwd)/data:/app/data -v $(pwd)/config.yaml:/app/config.yaml mainpipe mainpipe run -c config.yaml
-```
+# PowerShell:
+docker compose run --rm mainpipe mainpipe run `
+  --local-file data/raw/mainpipe_data_v1_deduped.jsonl `
+  --remove-duplicates false `
+  -c config.yaml
 
-### Example: Processing Sample Data
-
-```bash
-# Create sample data
-mkdir -p data/raw
-echo '{"text": "This is a sample text for processing."}' > data/raw/sample.jsonl
-echo '{"text": "Another example text with more content."}' >> data/raw/sample.jsonl
-
-# Update config.yaml to use local file
-# Then run the pipeline
-mainpipe run -c config.yaml
+# Note: --remove-duplicates false prevents re-running duplicate detection and 
+# preserves the deduplication statistics from Step 1
 ```
 
 ## Pipeline Architecture
 
 ```
+┌─────────────────┐
+│ Pre-processing  │  (Optional but recommended)
+│  - Deduplication│  Run: scripts/deduplicate_raw_data.py
+│  - MinHash LSH  │  Single-threaded, finds all duplicates
+└────────┬────────┘
+         │
+         ▼
 ┌─────────────────┐
 │ Data Acquisition│
 │  - URLs         │
@@ -174,7 +135,7 @@ mainpipe run -c config.yaml
 ┌─────────────────┐
 │ Quality Checks  │
 │  - Language     │
-│  - Duplicates   │
+│  - Duplicates   │  (If not pre-processed)
 │  - PII          │
 └────────┬────────┘
          │
@@ -252,64 +213,6 @@ data/
 - **Logging**: Centralized logging with ELK stack
 - **Tracing**: Distributed tracing with Jaeger
 - **Alerts**: Configure alerts for pipeline failures
-
-#### 6. Deployment Architecture
-
-```
-                    ┌──────────────┐
-                    │ Load Balancer│
-                    └──────┬───────┘
-                           │
-         ┌─────────────────┼─────────────────┐
-         │                 │                 │
-    ┌────▼────┐       ┌────▼────┐      ┌────▼────┐
-    │Worker 1 │       │Worker 2 │      │Worker N │
-    └────┬────┘       └────┬────┘      └────┬────┘
-         │                 │                 │
-         └─────────────────┼─────────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Message Queue│
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Data Storage │
-                    └──────────────┘
-```
-
-#### 7. Scalability Targets
-- **Throughput**: Process 1M+ documents per hour
-- **Latency**: < 1s per document for real-time processing
-- **Availability**: 99.9% uptime with auto-recovery
-- **Cost**: Optimize compute costs with spot instances
-
-## Development
-
-### Running Tests
-
-```bash
-# Install development dependencies
-pip install -r requirements-dev.txt
-
-# Run tests
-pytest tests/
-
-# Run with coverage
-pytest --cov=mainpipe tests/
-```
-
-### Code Quality
-
-```bash
-# Format code
-black src/
-
-# Lint code
-ruff check src/
-
-# Type checking
-mypy src/
-```
 
 ## License
 

@@ -213,3 +213,16 @@ data/reports/
 data/archived_runs/
 *.log
 pipeline.log
+
+# Test files and scripts
+config.test.yaml
+config.test_reporting.yaml
+test_*.py
+test_*.json
+tests/
+scripts/generate_sample_data.py
+scripts/generate_test_data.py
+scripts/generate_dedup_test_data.py
+scripts/smoke_test.sh
+scripts/regenerate_html.py
+requirements-dev.txt
